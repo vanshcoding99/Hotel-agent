@@ -46,3 +46,12 @@ For the price watcher:
 ## What I'd add next
 
 A small web page so I don't have to use the terminal, email alerts, and a chart showing how the price changed over time.
+
+## Web page
+
+I also made a simple page so people who don't use a terminal can search too, like my girlfriend. It runs on my laptop and anyone on the same Wi-Fi can open it on their phone.
+
+    pip install -r requirements.txt
+    DAILY_SEARCH_LIMIT=8 python app.py
+
+It prints two links, one for the laptop and one for phones on the same network. The daily limit keeps it from using up the free SerpApi searches. It only works while the laptop is on and the script is running, so putting it online with a password is on my list.
