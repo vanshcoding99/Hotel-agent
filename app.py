@@ -4,11 +4,14 @@ Run:  python app.py
 Then open the link it prints, on this computer or on a phone on the same Wi-Fi.
 """
 
+import hashlib
+import hmac
 import os
 import socket
-from datetime import date
+import time
+from datetime import timedelta
 
-from flask import Flask, render_template_string, request
+from flask import Flask, redirect, render_template_string, request, session, url_for
 
 import hotel_agent as ha
 
@@ -19,13 +22,27 @@ DAILY_LIMIT = int(os.getenv("DAILY_SEARCH_LIMIT", "20"))  # protects the free Se
 MAX_SHOWN = 8
 _usage = {"day": None, "count": 0}
 
+# Password protection: set APP_PASSWORD when the page is online, so strangers can't use up your searches.
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+_secret = os.getenv("SECRET_KEY")
+if not _secret and APP_PASSWORD:
+    _secret = hashlib.sha256(("hotel-finder-session:" + APP_PASSWORD).encode()).hexdigest()
+app.secret_key = _secret or os.urandom(32)
+app.config.update(
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.getenv("VERCEL") or os.getenv("RENDER")),
+    PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+)
+MAX_FAILS, FAIL_WINDOW = 8, 15 * 60
+_fails = {}
+
 
 class UserError(Exception):
     """A problem worth showing to the person using the page."""
 
 
 def take_search_slot():
-    today = date.today()
+    today = ha.today()
     if _usage["day"] != today:
         _usage["day"], _usage["count"] = today, 0
     if _usage["count"] >= DAILY_LIMIT:
@@ -35,11 +52,11 @@ def take_search_slot():
 
 
 def fmt_dates(check_in, check_out):
-    d1, d2 = date.fromisoformat(check_in), date.fromisoformat(check_out)
+    d1, d2 = ha.date.fromisoformat(check_in), ha.date.fromisoformat(check_out)
     left = f"{d1.strftime('%b')} {d1.day}"
     same_month = (d1.year, d1.month) == (d2.year, d2.month)
     right = str(d2.day) if same_month else f"{d2.strftime('%b')} {d2.day}"
-    year = f", {d1.year}" if d1.year != date.today().year else ""
+    year = f", {d1.year}" if d1.year != ha.today().year else ""
     return f"{left} to {right}{year}"
 
 
@@ -81,7 +98,7 @@ def run_search(text):
         raise UserError("Today's search limit is used up. It resets tomorrow.")
     try:
         params = ha.parse_request(text)
-        if params["check_in"] < date.today().isoformat():
+        if params["check_in"] < ha.today().isoformat():
             raise UserError("That check-in date has already passed. Pick dates from today onward.")
         nights = ha.nights_between(params["check_in"], params["check_out"])
         props = ha.fetch_hotels(params)
@@ -140,7 +157,9 @@ PAGE = """<!doctype html>
   :focus-visible { outline:3px solid var(--tide); outline-offset:3px; border-radius:8px; }
   .sr-only { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
 
-  .bar { padding:18px 0 0; }
+  .bar { padding:18px 16px 0; display:flex; justify-content:space-between; align-items:center; }
+  .signout { font-size:14px; color:var(--muted); text-decoration:none; }
+  .signout:hover { color:var(--text); }
   .brand { display:inline-flex; align-items:center; gap:8px; text-decoration:none;
            font:600 17px/1 var(--display); letter-spacing:-0.01em; }
   .brand svg { color:var(--tide); }
@@ -153,7 +172,11 @@ PAGE = """<!doctype html>
   textarea { display:block; width:100%; min-height:92px; border:0; background:transparent; color:var(--text);
              font:500 18px/1.45 var(--body); padding:12px 12px 6px; resize:none; }
   textarea::placeholder { color:var(--muted); opacity:.7; }
-  textarea:focus-visible { outline:none; }
+  textarea:focus-visible, .ask input:focus-visible { outline:none; }
+  .ask input { display:block; width:100%; border:0; background:transparent; color:var(--text);
+               font:500 18px/1.4 var(--body); padding:14px 12px; }
+  .ask input::placeholder { color:var(--muted); opacity:.7; }
+  .login-error { margin-top:14px; }
   .ask:focus-within { border-color:var(--tide); box-shadow:0 0 0 3px color-mix(in srgb, var(--tide) 22%, transparent); }
   .go { display:block; width:100%; min-height:52px; border:0; border-radius:14px; background:var(--tide);
         color:var(--on-tide); font:600 17px/1 var(--body); cursor:pointer; }
@@ -224,9 +247,24 @@ PAGE = """<!doctype html>
     <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="1.5" width="14" height="17" rx="4" fill="currentColor"/><circle cx="10" cy="6" r="1.8" fill="var(--bg)"/></svg>
     Hotel Finder
   </a>
+  {% if show_signout %}<a class="signout" href="/logout">Sign out</a>{% endif %}
 </header>
 
 <main class="wrap">
+  {% if login %}
+  <section class="hero">
+    <h1>Find the cheapest place to stay</h1>
+    <p class="lede">This page is private. Enter the password to start searching.</p>
+    <form method="post" action="/login">
+      <div class="ask">
+        <label for="pw" class="sr-only">Password</label>
+        <input type="password" name="password" id="pw" required autocomplete="current-password" placeholder="Password" autofocus>
+        <button class="go" type="submit">Sign in</button>
+      </div>
+    </form>
+    {% if error %}<p class="notice login-error" role="alert">{{ error }}</p>{% endif %}
+  </section>
+  {% else %}
   <section class="hero">
     <h1>Find the cheapest place to stay</h1>
     <p class="lede">Write the city, dates and budget the way you'd say them. It checks Google Hotels and sorts by what you'd pay for the whole stay.</p>
@@ -294,8 +332,10 @@ PAGE = """<!doctype html>
       {% endif %}
     {% endif %}
   </section>
+  {% endif %}
 </main>
 
+{% if not login %}
 <script>
   var form = document.getElementById('form'), go = document.getElementById('go'), q = document.getElementById('q');
   document.querySelectorAll('.try button').forEach(function (b) {
@@ -312,6 +352,7 @@ PAGE = """<!doctype html>
   });
   window.addEventListener('pageshow', function () { go.disabled = false; go.textContent = 'Find hotels'; });
 </script>
+{% endif %}
 </body>
 </html>
 """
@@ -323,11 +364,66 @@ EXAMPLES = [
 ]
 
 
+def client_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return forwarded.split(",")[0].strip() or request.remote_addr or "unknown"
+
+
+def too_many_fails(ip):
+    count, start = _fails.get(ip, (0, 0.0))
+    if time.time() - start > FAIL_WINDOW:
+        _fails.pop(ip, None)
+        return False
+    return count >= MAX_FAILS
+
+
+def record_fail(ip):
+    count, start = _fails.get(ip, (0, time.time()))
+    if time.time() - start > FAIL_WINDOW:
+        count, start = 0, time.time()
+    _fails[ip] = (count + 1, start)
+
+
+@app.before_request
+def require_password():
+    if not APP_PASSWORD or request.endpoint == "login" or session.get("ok"):
+        return None
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not APP_PASSWORD or session.get("ok"):
+        return redirect(url_for("home"))
+    error = ""
+    if request.method == "POST":
+        ip = client_ip()
+        if too_many_fails(ip):
+            error = "Too many wrong tries. Wait 15 minutes, then try again."
+        elif hmac.compare_digest(request.form.get("password", "").encode(), APP_PASSWORD.encode()):
+            _fails.pop(ip, None)
+            session.clear()
+            session.permanent = True
+            session["ok"] = True
+            return redirect(url_for("home"))
+        else:
+            record_fail(ip)
+            error = "That password isn't right. Check it and try again."
+    return render_template_string(PAGE, login=True, error=error, show_signout=False)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login") if APP_PASSWORD else url_for("home"))
+
+
 @app.route("/")
 def home():
     q = request.args.get("q", "").strip()[:300]
     ctx = {"q": q, "examples": EXAMPLES, "searched": False, "error": "", "results": [],
-           "summary": "", "understood": [], "cur": "CAD", "nights": 0}
+           "summary": "", "understood": [], "cur": "CAD", "nights": 0,
+           "login": False, "show_signout": bool(APP_PASSWORD)}
     if q:
         ctx["searched"] = True
         try:
@@ -354,5 +450,6 @@ if __name__ == "__main__":
     print("\nHotel Finder is running.")
     print(f"  On this computer:        http://localhost:{PORT}")
     print(f"  On a phone (same Wi-Fi): http://{lan_ip()}:{PORT}")
-    print(f"  Search limit: {DAILY_LIMIT} per day. Press Ctrl+C to stop.\n")
+    print(f"  Search limit: {DAILY_LIMIT} per day. Password: {'on' if APP_PASSWORD else 'off'}.")
+    print("  Press Ctrl+C to stop.\n")
     app.run(host="0.0.0.0", port=PORT, debug=False)

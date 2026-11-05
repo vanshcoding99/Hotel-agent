@@ -12,7 +12,8 @@ import argparse
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import anthropic
 import requests
@@ -22,6 +23,12 @@ load_dotenv(override=True)
 
 SERPAPI_URL = "https://serpapi.com/search.json"
 MODEL = "claude-haiku-5-5"  # cheapest tier, plenty for parsing and summarizing
+LOCAL_TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "America/Vancouver"))
+
+
+def today():
+    """Today's date where we live, even when the server runs on UTC."""
+    return datetime.now(LOCAL_TZ).date()
 
 SEARCH_TOOL = {
     "name": "search_hotels",
@@ -58,7 +65,7 @@ def parse_request(text):
         model=MODEL,
         max_tokens=300,
         system=(
-            f"Today is {date.today().isoformat()}. Convert the user's hotel request "
+            f"Today is {today().isoformat()}. Convert the user's hotel request "
             "into a search_hotels call. If a date has no year, use the next future "
             "occurrence. Default to 2 adults and CAD unless told otherwise."
         ),
