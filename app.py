@@ -7,11 +7,13 @@ Then open the link it prints, on this computer or on a phone on the same Wi-Fi.
 import hashlib
 import hmac
 import os
+import re
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
-from flask import Flask, redirect, render_template_string, request, session, url_for
+from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
 
 import hotel_agent as ha
 
@@ -34,6 +36,8 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
 )
 MAX_FAILS, FAIL_WINDOW = 8, 15 * 60
+_compare_cache = {}
+COMPARE_TTL = 60 * 60  # reuse a hotel's site prices for an hour instead of spending another search
 _fails = {}
 
 
@@ -76,7 +80,7 @@ def pills(params, nights):
     return items
 
 
-def decorate(results):
+def decorate(results, best_rows=None):
     """Add what the page needs: extra cost vs the cheapest, and which one is top rated."""
     if not results:
         return []
@@ -89,6 +93,7 @@ def decorate(results):
         d["extra"] = h["total"] - base
         d["cheapest"] = i == 0
         d["top"] = top is not None and h is top
+        d["best"] = best_rows[0] if (i == 0 and best_rows) else None
         out.append(d)
     return out
 
@@ -113,13 +118,45 @@ def run_search(text):
         app.logger.exception("search failed")
         raise UserError("The search didn't go through. Wait a minute and try again.")
 
-    summary = ""
+    summary, best_rows = "", []
     if results:
-        try:
-            summary = ha.summarize(params, results)
-        except Exception:
-            app.logger.exception("summary failed")  # the list is still useful without it
-    return params, nights, results[:MAX_SHOWN], summary
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            want_summary = pool.submit(ha.summarize, params, results)
+            want_sites = pool.submit(top_hotel_sites, params, nights, results[0])
+            try:
+                summary = want_summary.result()
+            except (Exception, SystemExit):
+                app.logger.exception("summary failed")  # the list is still useful without it
+            try:
+                best_rows = want_sites.result()
+            except (Exception, SystemExit):
+                app.logger.exception("booking site lookup failed")  # the card falls back to the hotel's own site
+    return params, nights, results[:MAX_SHOWN], summary, best_rows
+
+
+def site_rows(token, check_in, check_out, adults, currency, nights):
+    """Booking-site prices for one hotel, reused for an hour so the same hotel never costs twice."""
+    key = (token, check_in, check_out, adults, currency)
+    hit = _compare_cache.get(key)
+    if hit and time.time() - hit[0] < COMPARE_TTL:
+        return hit[1]
+    if not take_search_slot():
+        raise UserError("Today's search limit is used up. It resets tomorrow.")
+    trip = {"check_in": check_in, "check_out": check_out, "adults": adults, "currency": currency}
+    rows = ha.site_prices(ha.fetch_property_prices(token, trip), nights)
+    if len(_compare_cache) > 200:
+        _compare_cache.clear()
+    _compare_cache[key] = (time.time(), rows)
+    return rows
+
+
+def top_hotel_sites(params, nights, top):
+    """Find which booking site has the cheapest hotel's price. Uses one extra search."""
+    if not top.get("token"):
+        return []
+    adults = max(1, min(int(params.get("adults", 2)), 10))
+    currency = str(params.get("currency", "CAD")).upper()
+    return site_rows(top["token"], params["check_in"], params["check_out"], adults, currency, nights)
 
 
 PAGE = """<!doctype html>
@@ -138,7 +175,7 @@ PAGE = """<!doctype html>
   :root {
     --bg:#EEF2F3; --surface:#FFFFFF; --text:#0F2A36; --muted:#55707B; --line:#D5DEE2;
     --tide:#1C6E7D; --on-tide:#FFFFFF; --glass:#D3ECE6; --on-glass:#0F4A43; --buoy:#F2A93B;
-    --ticket:#0F2A36; --on-ticket:#F3F8F9; --ticket-muted:#A9C3CB; --alert:#FBEBDD; --on-alert:#7A3B0A;
+    --ticket:#0F2A36; --on-ticket:#F3F8F9; --ticket-muted:#A9C3CB; --alert:#FBEBDD; --on-alert:#7A3B0A; --good:#0B6B3A;
     --display:"Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
     --body:"Albert Sans", -apple-system, system-ui, "Segoe UI", sans-serif;
   }
@@ -146,7 +183,7 @@ PAGE = """<!doctype html>
     :root {
       --bg:#0A1820; --surface:#12262F; --text:#E6EEF0; --muted:#8FA8B1; --line:#22404B;
       --tide:#5CC0CE; --on-tide:#06222A; --glass:#1C3F3A; --on-glass:#BFE9DF;
-      --ticket:#1D4352; --on-ticket:#F3F8F9; --ticket-muted:#A9C3CB; --alert:#3A2614; --on-alert:#F7C99A;
+      --ticket:#1D4352; --on-ticket:#F3F8F9; --ticket-muted:#A9C3CB; --alert:#3A2614; --on-alert:#F7C99A; --good:#6FE3A1;
     }
   }
   * { box-sizing:border-box; }
@@ -202,6 +239,7 @@ PAGE = """<!doctype html>
   .stars { display:inline-flex; align-items:center; gap:4px; }
   .stars svg { width:14px; height:14px; }
   .visit { font-size:14px; font-weight:600; color:var(--tide); margin-top:8px; display:inline-block; }
+  .deal { margin:8px 0 0; font-weight:600; font-size:15px; }
   .amount { font:700 26px/1 var(--display); letter-spacing:-0.02em; white-space:nowrap; }
   .amount small { font:600 13px/1 var(--body); letter-spacing:0; margin-right:3px; }
   .per { font-size:13px; color:var(--muted); margin-top:5px; white-space:nowrap; }
@@ -221,6 +259,28 @@ PAGE = """<!doctype html>
   .ticket .price::after { bottom:-9px; }
   .ticket .amount { color:var(--buoy); font-size:34px; }
   .ticket .tag.cheap { background:var(--buoy); color:#0F2A36; }
+
+  .compare { margin:4px 2px 0; }
+  .cmp-btn { border:0; background:transparent; color:var(--tide); font:600 14px/1 var(--body); padding:12px 8px;
+             min-height:44px; cursor:pointer; text-align:left; }
+  .cmp-btn::after { content:""; display:inline-block; width:7px; height:7px; margin-left:8px; border-right:2px solid currentColor;
+                    border-bottom:2px solid currentColor; transform:translateY(-2px) rotate(45deg); transition:transform .15s; }
+  .cmp-btn[aria-expanded="true"]::after { transform:translateY(1px) rotate(-135deg); }
+  .cmp-btn:disabled { opacity:.7; cursor:progress; }
+  .cmp-panel { margin:0 0 8px; }
+  .cmp-panel .notice { font-size:14px; }
+  .cmp-wait { color:var(--muted); font-size:14px; margin:0 8px 8px; }
+  .sites { list-style:none; margin:0; padding:0; border:1px solid var(--line); border-radius:14px; background:var(--surface); overflow:hidden; }
+  .site + .site { border-top:1px solid var(--line); }
+  .site > a, .site > div { display:flex; justify-content:space-between; gap:12px; align-items:center; padding:12px 14px; text-decoration:none; }
+  .site > a:hover { background:color-mix(in srgb, var(--tide) 8%, transparent); }
+  .s-name { font-weight:600; overflow-wrap:anywhere; }
+  .s-tags { display:flex; flex-wrap:wrap; gap:6px; margin-top:5px; }
+  .s-price { text-align:right; white-space:nowrap; }
+  .s-price b { font:700 18px/1.1 var(--display); display:block; }
+  .s-price small { color:var(--muted); font-size:13px; }
+  .site.best .s-price b { color:var(--good); }
+  .cmp-note { color:var(--muted); font-size:13px; margin:8px 8px 0; }
 
   .notice { background:var(--alert); color:var(--on-alert); border-radius:14px; padding:14px 16px; margin:0; font-weight:500; }
   .fine { color:var(--muted); font-size:13px; margin:22px 0 40px; max-width:60ch; }
@@ -299,10 +359,11 @@ PAGE = """<!doctype html>
         <p class="notice">No hotels matched. Raise the budget, lower the minimum rating, or try other dates.</p>
       {% else %}
         {% if summary %}<p class="summary">{{ summary }}</p>{% endif %}
-        <ol class="list">
+        <ol class="list" id="list" data-check-in="{{ trip.check_in }}" data-check-out="{{ trip.check_out }}" data-adults="{{ trip.adults }}" data-currency="{{ cur }}">
         {% for h in results %}
           <li>
-            {% if h.link %}<a class="card {{ 'ticket' if h.cheapest else 'row' }}" href="{{ h.link }}" target="_blank" rel="noopener noreferrer">
+            {% set go_to = h.best.link if (h.best and h.best.link) else h.link %}
+            {% if go_to %}<a class="card {{ 'ticket' if h.cheapest else 'row' }}" href="{{ go_to }}" target="_blank" rel="noopener noreferrer">
             {% else %}<div class="card {{ 'ticket' if h.cheapest else 'row' }}">{% endif %}
               <div class="info">
                 {% if h.cheapest or h.top %}
@@ -318,13 +379,21 @@ PAGE = """<!doctype html>
                   {% else %}<span>No rating yet</span>{% endif %}
                   {% if not h.cheapest and h.extra >= 1 %}<span>{{ cur }} {{ "%.0f"|format(h.extra) }} more than the cheapest</span>{% endif %}
                 </p>
-                {% if h.link %}<span class="visit">Open hotel website</span>{% endif %}
+                {% if h.best %}<p class="deal">{{ cur }} {{ "%.0f"|format(h.best.total) }}{% if nights > 1 %} for {{ nights }} nights{% endif %} on {{ h.best.source }}</p>{% endif %}
+                {% if h.best and h.best.link %}<span class="visit">Book on {{ h.best.source }}</span>
+                {% elif h.link %}<span class="visit">Hotel's own site (price may differ)</span>{% endif %}
               </div>
               <div class="price">
                 <div class="amount"><small>{{ cur }}</small>{{ "%.0f"|format(h.total) }}</div>
                 <div class="per">{{ cur }} {{ "%.0f"|format(h.per_night) }} a night</div>
               </div>
-            {% if h.link %}</a>{% else %}</div>{% endif %}
+            {% if go_to %}</a>{% else %}</div>{% endif %}
+            {% if h.token %}
+            <div class="compare">
+              <button type="button" class="cmp-btn" data-token="{{ h.token }}" aria-expanded="false">Compare booking sites</button>
+              <div class="cmp-panel" hidden></div>
+            </div>
+            {% endif %}
           </li>
         {% endfor %}
         </ol>
@@ -348,8 +417,79 @@ PAGE = """<!doctype html>
     go.disabled = true; go.textContent = 'Checking prices';
     var r = document.getElementById('results');
     r.setAttribute('aria-busy', 'true');
-    r.innerHTML = '<p class="waiting">Checking prices. This takes about 10 seconds.</p><div class="list"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
+    r.innerHTML = '<p class="waiting">Checking prices and booking sites. This takes about 15 seconds.</p><div class="list"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
   });
+  var list = document.getElementById('list');
+  function el(tagName, cls, text) {
+    var n = document.createElement(tagName);
+    if (cls) n.className = cls;
+    if (text) n.textContent = text;
+    return n;
+  }
+  function showNotice(panel, text) {
+    panel.textContent = '';
+    var p = el('p', 'notice', text); p.setAttribute('role', 'alert'); panel.appendChild(p);
+  }
+  function renderSites(panel, rows, cur) {
+    panel.textContent = '';
+    if (!rows.length) { showNotice(panel, 'No booking site listed a price for these dates.'); return; }
+    var ul = el('ul', 'sites');
+    rows.forEach(function (r, i) {
+      var li = el('li', 'site' + (i === 0 ? ' best' : ''));
+      var row = /^https?:/.test(r.link) ? el('a') : el('div');
+      if (row.tagName === 'A') { row.href = r.link; row.target = '_blank'; row.rel = 'noopener noreferrer'; }
+      var main = el('span', 's-main');
+      main.appendChild(el('span', 's-name', r.source));
+      var tags = el('span', 's-tags');
+      if (i === 0) tags.appendChild(el('span', 'tag cheap', 'Cheapest'));
+      if (r.official) tags.appendChild(el('span', 'tag', "Hotel's own site"));
+      if (r.free_cancellation) tags.appendChild(el('span', 'tag', 'Free cancellation'));
+      if (tags.childNodes.length) main.appendChild(tags);
+      var price = el('span', 's-price');
+      price.appendChild(el('b', '', cur + ' ' + Math.round(r.total)));
+      price.appendChild(el('small', '', cur + ' ' + Math.round(r.per_night) + ' a night'));
+      row.appendChild(main); row.appendChild(price); li.appendChild(row); ul.appendChild(li);
+    });
+    panel.appendChild(ul);
+    panel.appendChild(el('p', 'cmp-note', 'Check the final price on the site before booking.'));
+  }
+  if (list) {
+    list.addEventListener('click', function (e) {
+      var btn = e.target.closest('.cmp-btn');
+      if (!btn) return;
+      var panel = btn.nextElementSibling;
+      if (btn.dataset.loaded === '1') {
+        var open = panel.hidden;
+        panel.hidden = !open;
+        btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+        btn.textContent = open ? 'Hide booking sites' : 'Compare booking sites';
+        return;
+      }
+      var cur = list.dataset.currency;
+      var qs = new URLSearchParams({ token: btn.dataset.token, check_in: list.dataset.checkIn,
+        check_out: list.dataset.checkOut, adults: list.dataset.adults, currency: cur });
+      btn.disabled = true; btn.textContent = 'Checking booking sites';
+      panel.hidden = false; panel.textContent = '';
+      panel.appendChild(el('p', 'cmp-wait', 'This takes a few seconds.'));
+      fetch('/compare?' + qs.toString(), { headers: { Accept: 'application/json' } })
+        .then(function (r) {
+          if (r.redirected || (r.headers.get('content-type') || '').indexOf('json') === -1) {
+            throw new Error('Your session ended. Reload the page and sign in again.');
+          }
+          return r.json();
+        })
+        .then(function (data) {
+          if (data.error) throw new Error(data.error);
+          renderSites(panel, data.rows, cur);
+          btn.dataset.loaded = '1'; btn.setAttribute('aria-expanded', 'true'); btn.textContent = 'Hide booking sites';
+        })
+        .catch(function (err) {
+          showNotice(panel, err.message || 'Could not load the booking sites. Try again.');
+          btn.textContent = 'Try again';
+        })
+        .then(function () { btn.disabled = false; });
+    });
+  }
   window.addEventListener('pageshow', function () { go.disabled = false; go.textContent = 'Find hotels'; });
 </script>
 {% endif %}
@@ -418,18 +558,48 @@ def logout():
     return redirect(url_for("login") if APP_PASSWORD else url_for("home"))
 
 
+@app.route("/compare")
+def compare():
+    """Prices on each booking site for one hotel. Costs one search, so results are reused for an hour."""
+    token = request.args.get("token", "")
+    currency = request.args.get("currency", "CAD").upper()
+    try:
+        adults = max(1, min(int(request.args.get("adults", "2")), 10))
+        check_in, check_out = request.args.get("check_in", ""), request.args.get("check_out", "")
+        ha.date.fromisoformat(check_in)
+        ha.date.fromisoformat(check_out)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{10,400}", token) or not re.fullmatch(r"[A-Z]{3}", currency):
+            raise ValueError("bad input")
+    except ValueError:
+        return jsonify(error="Those trip details look wrong. Run the search again."), 400
+
+    try:
+        nights = ha.nights_between(check_in, check_out)
+        rows = site_rows(token, check_in, check_out, adults, currency, nights)
+    except UserError as e:
+        return jsonify(error=str(e)), 429
+    except SystemExit as e:
+        return jsonify(error=str(e.code)), 502
+    except Exception:
+        app.logger.exception("compare failed")
+        return jsonify(error="Couldn't load the booking sites. Wait a minute and try again."), 502
+    return jsonify(rows=rows)
+
+
 @app.route("/")
 def home():
     q = request.args.get("q", "").strip()[:300]
     ctx = {"q": q, "examples": EXAMPLES, "searched": False, "error": "", "results": [],
            "summary": "", "understood": [], "cur": "CAD", "nights": 0,
-           "login": False, "show_signout": bool(APP_PASSWORD)}
+           "login": False, "show_signout": bool(APP_PASSWORD), "trip": {}}
     if q:
         ctx["searched"] = True
         try:
-            params, nights, results, summary = run_search(q)
-            ctx.update(results=decorate(results), summary=summary, nights=nights,
-                       understood=pills(params, nights), cur=params.get("currency", "CAD"))
+            params, nights, results, summary, best_rows = run_search(q)
+            ctx.update(results=decorate(results, best_rows), summary=summary, nights=nights,
+                       understood=pills(params, nights), cur=params.get("currency", "CAD"),
+                       trip={"check_in": params["check_in"], "check_out": params["check_out"],
+                             "adults": params.get("adults", 2)})
         except UserError as e:
             ctx["error"] = str(e)
     return render_template_string(PAGE, **ctx)

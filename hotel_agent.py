@@ -2,6 +2,11 @@
 
 Plain English request in, cheapest hotels out.
 
+Flow:
+1. Claude turns the request into search parameters (small job).
+2. Plain Python calls SerpApi's Google Hotels endpoint and sorts by price.
+3. Claude writes a short summary of the top results (optional).
+
 Usage:
     python hotel_agent.py "Victoria BC, Nov 20 to 23, under $150 a night"
     python hotel_agent.py            (prompts you for a request)
@@ -139,9 +144,62 @@ def normalize(properties, nights, max_per_night=None, min_rating=None):
                 "total": total,
                 "rating": h.get("overall_rating"),
                 "link": h.get("link", ""),
+                "token": h.get("property_token", ""),
             }
         )
     return sorted(results, key=lambda x: x["total"])
+
+
+def fetch_property_prices(token, p):
+    """Ask SerpApi for the price on each booking site for one hotel. Uses 1 search."""
+    key = os.getenv("SERPAPI_KEY")
+    if not key:
+        sys.exit("Missing SERPAPI_KEY. Add it to your .env file.")
+    params = {
+        "engine": "google_hotels",
+        "property_token": token,
+        "check_in_date": p["check_in"],
+        "check_out_date": p["check_out"],
+        "adults": p.get("adults", 2),
+        "currency": p.get("currency", "CAD"),
+        "gl": "ca",
+        "hl": "en",
+        "api_key": key,
+    }
+    r = requests.get(SERPAPI_URL, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if "error" in data:
+        sys.exit(f"SerpApi error: {data['error']}")
+    return data
+
+
+def site_prices(data, nights):
+    """One row per booking site, cheapest total first."""
+    best = {}
+    for entry in (data.get("featured_prices") or []) + (data.get("prices") or []):
+        source = entry.get("source")
+        rate = entry.get("rate_per_night") or {}
+        whole = entry.get("total_rate") or {}
+        night, total = rate.get("extracted_lowest"), whole.get("extracted_lowest")
+        if not source or (night is None and total is None):
+            continue
+        if total is None:
+            total = night * nights
+        if night is None:
+            night = total / nights
+        link = entry.get("link") or ""
+        row = {
+            "source": source,
+            "total": total,
+            "per_night": night,
+            "official": bool(entry.get("official")),
+            "free_cancellation": bool(entry.get("free_cancellation")),
+            "link": link if link.startswith(("http://", "https://")) else "",
+        }
+        if source not in best or total < best[source]["total"]:
+            best[source] = row
+    return sorted(best.values(), key=lambda r: r["total"])
 
 
 def summarize(request, results):
