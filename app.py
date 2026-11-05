@@ -1,4 +1,4 @@
-"""Simple web page for the hotel agent, so anyone on the home Wi-Fi can use it.
+"""Hotel Finder: a simple web page for the hotel agent.
 
 Run:  python app.py
 Then open the link it prints, on this computer or on a phone on the same Wi-Fi.
@@ -34,28 +34,55 @@ def take_search_slot():
     return True
 
 
-def describe(params):
-    """One line saying how the request was understood, so mistakes are easy to spot."""
+def fmt_dates(check_in, check_out):
+    d1, d2 = date.fromisoformat(check_in), date.fromisoformat(check_out)
+    left = f"{d1.strftime('%b')} {d1.day}"
+    same_month = (d1.year, d1.month) == (d2.year, d2.month)
+    right = str(d2.day) if same_month else f"{d2.strftime('%b')} {d2.day}"
+    year = f", {d1.year}" if d1.year != date.today().year else ""
+    return f"{left} to {right}{year}"
+
+
+def pills(params, nights):
+    """Short pieces showing how the request was understood, so mistakes are easy to spot."""
     cur = params.get("currency", "CAD")
-    parts = [
+    adults = params.get("adults", 2)
+    items = [
         params["location"],
-        f"{params['check_in']} to {params['check_out']}",
-        f"{params.get('adults', 2)} adults",
+        f"{fmt_dates(params['check_in'], params['check_out'])} ({nights} night{'s' if nights != 1 else ''})",
+        f"{adults} adult{'s' if adults != 1 else ''}",
     ]
     if params.get("max_price_per_night"):
-        parts.append(f"under {cur} {params['max_price_per_night']:.0f} a night")
+        items.append(f"Under {cur} {params['max_price_per_night']:.0f} a night")
     if params.get("min_rating"):
-        parts.append(f"{params['min_rating']} stars or better")
-    return " | ".join(parts)
+        items.append(f"{params['min_rating']:g}+ stars")
+    return items
+
+
+def decorate(results):
+    """Add what the page needs: extra cost vs the cheapest, and which one is top rated."""
+    if not results:
+        return []
+    base = results[0]["total"]
+    rated = [h for h in results if h.get("rating")]
+    top = max(rated, key=lambda h: h["rating"]) if len(results) > 1 and rated else None
+    out = []
+    for i, h in enumerate(results):
+        d = dict(h)
+        d["extra"] = h["total"] - base
+        d["cheapest"] = i == 0
+        d["top"] = top is not None and h is top
+        out.append(d)
+    return out
 
 
 def run_search(text):
     if not take_search_slot():
-        raise UserError("Today's search limit was reached. Try again tomorrow.")
+        raise UserError("Today's search limit is used up. It resets tomorrow.")
     try:
         params = ha.parse_request(text)
         if params["check_in"] < date.today().isoformat():
-            raise UserError("That check-in date is in the past. Try dates from today onward.")
+            raise UserError("That check-in date has already passed. Pick dates from today onward.")
         nights = ha.nights_between(params["check_in"], params["check_out"])
         props = ha.fetch_hotels(params)
         results = ha.normalize(
@@ -67,7 +94,7 @@ def run_search(text):
         raise UserError(str(e.code))
     except Exception:
         app.logger.exception("search failed")
-        raise UserError("Something went wrong while searching. Please try again in a minute.")
+        raise UserError("The search didn't go through. Wait a minute and try again.")
 
     summary = ""
     if results:
@@ -75,7 +102,7 @@ def run_search(text):
             summary = ha.summarize(params, results)
         except Exception:
             app.logger.exception("summary failed")  # the list is still useful without it
-    return params, results[:MAX_SHOWN], summary
+    return params, nights, results[:MAX_SHOWN], summary
 
 
 PAGE = """<!doctype html>
@@ -84,81 +111,207 @@ PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Hotel Finder</title>
+<meta name="theme-color" content="#EEF2F3" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0A1820" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Albert+Sans:wght@400;500;600&family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2430; --muted:#667085; --line:#e3e7ee; --accent:#1f6feb; --good:#067647; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#12151a; --card:#1b2028; --text:#e8ecf2; --muted:#9aa4b2; --line:#2a313c; --accent:#6ea8ff; --good:#4ade80; }
+  :root {
+    --bg:#EEF2F3; --surface:#FFFFFF; --text:#0F2A36; --muted:#55707B; --line:#D5DEE2;
+    --tide:#1C6E7D; --on-tide:#FFFFFF; --glass:#D3ECE6; --on-glass:#0F4A43; --buoy:#F2A93B;
+    --ticket:#0F2A36; --on-ticket:#F3F8F9; --ticket-muted:#A9C3CB; --alert:#FBEBDD; --on-alert:#7A3B0A;
+    --display:"Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
+    --body:"Albert Sans", -apple-system, system-ui, "Segoe UI", sans-serif;
   }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 -apple-system, system-ui, "Segoe UI", sans-serif; }
-  main { max-width:640px; margin:0 auto; padding:24px 16px 48px; }
-  h1 { font-size:26px; margin:0 0 4px; }
-  .sub { color:var(--muted); margin:0 0 20px; }
-  textarea { width:100%; min-height:84px; padding:12px; border:1px solid var(--line); border-radius:10px;
-             background:var(--card); color:var(--text); font:inherit; resize:vertical; }
-  button.go { margin-top:10px; width:100%; padding:13px; border:0; border-radius:10px; background:var(--accent);
-              color:#fff; font:inherit; font-weight:600; cursor:pointer; }
-  button.go:disabled { opacity:.6; cursor:wait; }
-  .chips { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0 0; }
-  .chip { border:1px solid var(--line); background:var(--card); color:var(--text); border-radius:999px;
-          padding:6px 12px; font:inherit; font-size:14px; cursor:pointer; }
-  .note, .error, .summary { border-radius:10px; padding:12px 14px; margin:18px 0 0; }
-  .note { color:var(--muted); font-size:14px; padding:0; }
-  .error { background:#fde8e8; color:#8a1c1c; }
-  @media (prefers-color-scheme: dark) { .error { background:#3a1b1b; color:#ffb4b4; } }
-  .summary { background:var(--card); border:1px solid var(--line); }
-  .hotel { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin:12px 0; }
-  .hotel .top { display:flex; justify-content:space-between; gap:12px; align-items:baseline; }
-  .name { font-weight:600; }
-  .total { font-weight:700; font-size:20px; white-space:nowrap; }
-  .meta { color:var(--muted); font-size:14px; margin-top:2px; }
-  .badge { color:var(--good); font-weight:600; }
-  .hotel a { display:inline-block; margin-top:8px; color:var(--accent); text-decoration:none; font-size:14px; }
-  footer { color:var(--muted); font-size:13px; margin-top:28px; }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0A1820; --surface:#12262F; --text:#E6EEF0; --muted:#8FA8B1; --line:#22404B;
+      --tide:#5CC0CE; --on-tide:#06222A; --glass:#1C3F3A; --on-glass:#BFE9DF;
+      --ticket:#1D4352; --on-ticket:#F3F8F9; --ticket-muted:#A9C3CB; --alert:#3A2614; --on-alert:#F7C99A;
+    }
+  }
+  * { box-sizing:border-box; }
+  html { -webkit-text-size-adjust:100%; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.55 var(--body); }
+  .wrap { max-width:720px; margin:0 auto; padding:0 16px; }
+  a { color:inherit; }
+  :focus-visible { outline:3px solid var(--tide); outline-offset:3px; border-radius:8px; }
+  .sr-only { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
+
+  .bar { padding:18px 0 0; }
+  .brand { display:inline-flex; align-items:center; gap:8px; text-decoration:none;
+           font:600 17px/1 var(--display); letter-spacing:-0.01em; }
+  .brand svg { color:var(--tide); }
+
+  .hero { padding:36px 0 8px; }
+  h1 { font:800 clamp(34px, 8.6vw, 56px)/1.02 var(--display); letter-spacing:-0.03em; margin:0; max-width:14ch; }
+  .lede { color:var(--muted); font-size:17px; margin:14px 0 24px; max-width:46ch; }
+
+  .ask { background:var(--surface); border:1px solid var(--line); border-radius:20px; padding:8px; }
+  textarea { display:block; width:100%; min-height:92px; border:0; background:transparent; color:var(--text);
+             font:500 18px/1.45 var(--body); padding:12px 12px 6px; resize:none; }
+  textarea::placeholder { color:var(--muted); opacity:.7; }
+  textarea:focus-visible { outline:none; }
+  .ask:focus-within { border-color:var(--tide); box-shadow:0 0 0 3px color-mix(in srgb, var(--tide) 22%, transparent); }
+  .go { display:block; width:100%; min-height:52px; border:0; border-radius:14px; background:var(--tide);
+        color:var(--on-tide); font:600 17px/1 var(--body); cursor:pointer; }
+  .go:disabled { opacity:.7; cursor:progress; }
+
+  .try { list-style:none; display:flex; flex-wrap:wrap; gap:8px; padding:0; margin:14px 0 0; }
+  .try button { border:1px solid var(--line); background:transparent; color:var(--text); border-radius:999px;
+                padding:7px 13px; font:500 14px/1.2 var(--body); cursor:pointer; text-align:left; }
+  .try button:hover { border-color:var(--tide); }
+
+  .results { padding:28px 0 0; }
+  .understood { list-style:none; display:flex; flex-wrap:wrap; gap:6px; padding:0; margin:0 0 14px; }
+  .understood li { background:var(--glass); color:var(--on-glass); border-radius:8px; padding:4px 10px;
+                   font:500 14px/1.4 var(--body); }
+  .summary { margin:0 0 20px; font-size:17px; max-width:60ch; }
+
+  .list { list-style:none; padding:0; margin:0; display:grid; gap:10px; }
+  .card { display:grid; grid-template-columns:1fr auto; text-decoration:none; border-radius:16px; overflow:hidden; }
+  .card .info { padding:16px 16px 16px 18px; min-width:0; }
+  .card .price { padding:16px 18px; text-align:right; display:flex; flex-direction:column; justify-content:center; }
+  .name { font:600 17px/1.3 var(--body); margin:0; overflow-wrap:anywhere; }
+  .meta { margin:4px 0 0; font-size:14px; color:var(--muted); display:flex; flex-wrap:wrap; gap:4px 12px; align-items:center; }
+  .stars { display:inline-flex; align-items:center; gap:4px; }
+  .stars svg { width:14px; height:14px; }
+  .visit { font-size:14px; font-weight:600; color:var(--tide); margin-top:8px; display:inline-block; }
+  .amount { font:700 26px/1 var(--display); letter-spacing:-0.02em; white-space:nowrap; }
+  .amount small { font:600 13px/1 var(--body); letter-spacing:0; margin-right:3px; }
+  .per { font-size:13px; color:var(--muted); margin-top:5px; white-space:nowrap; }
+  .tags { display:flex; gap:6px; margin:0 0 6px; }
+  .tag { font:600 12px/1 var(--body); padding:5px 8px; border-radius:6px; background:var(--glass); color:var(--on-glass); }
+
+  .row { background:var(--surface); border:1px solid var(--line); }
+  a.row:hover { border-color:var(--tide); }
+
+  .ticket { background:var(--ticket); color:var(--on-ticket); }
+  .ticket .meta, .ticket .per { color:var(--ticket-muted); }
+  .ticket .visit { color:var(--buoy); }
+  .ticket .price { position:relative; border-left:2px dashed color-mix(in srgb, var(--on-ticket) 30%, transparent); min-width:128px; }
+  .ticket .price::before, .ticket .price::after { content:""; position:absolute; left:-10px; width:18px; height:18px;
+                                                  border-radius:50%; background:var(--bg); }
+  .ticket .price::before { top:-9px; }
+  .ticket .price::after { bottom:-9px; }
+  .ticket .amount { color:var(--buoy); font-size:34px; }
+  .ticket .tag.cheap { background:var(--buoy); color:#0F2A36; }
+
+  .notice { background:var(--alert); color:var(--on-alert); border-radius:14px; padding:14px 16px; margin:0; font-weight:500; }
+  .fine { color:var(--muted); font-size:13px; margin:22px 0 40px; max-width:60ch; }
+
+  .skel { height:82px; border-radius:16px; background:var(--surface); border:1px solid var(--line); position:relative; overflow:hidden; }
+  .skel:first-child { height:104px; background:var(--ticket); border:0; }
+  .skel::after { content:""; position:absolute; inset:0; transform:translateX(-100%);
+                 background:linear-gradient(90deg, transparent, color-mix(in srgb, var(--tide) 14%, transparent), transparent);
+                 animation:sweep 1.3s ease-in-out infinite; }
+  .waiting { color:var(--muted); margin:0 0 12px; }
+  @keyframes sweep { to { transform:translateX(100%); } }
+  @media (prefers-reduced-motion: reduce) { .skel::after { animation:none; } }
+
+  @media (min-width:640px) {
+    .hero { padding-top:64px; }
+    .ask { display:grid; grid-template-columns:1fr auto; align-items:end; gap:8px; }
+    .go { width:auto; padding:0 26px; }
+  }
 </style>
 </head>
 <body>
-<main>
-  <h1>Hotel Finder</h1>
-  <p class="sub">Say where, when and what you want. It finds the cheapest options.</p>
+<header class="bar wrap">
+  <a class="brand" href="/">
+    <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="1.5" width="14" height="17" rx="4" fill="currentColor"/><circle cx="10" cy="6" r="1.8" fill="var(--bg)"/></svg>
+    Hotel Finder
+  </a>
+</header>
 
-  <form method="get" action="/" onsubmit="var b=document.getElementById('go'); b.disabled=true; b.textContent='Searching... this takes about 10 seconds';">
-    <textarea name="q" id="q" placeholder="Example: Victoria, Nov 20 to 23, under $150 a night, at least 3.5 stars" required>{{ q }}</textarea>
-    <button class="go" id="go" type="submit">Find hotels</button>
-  </form>
+<main class="wrap">
+  <section class="hero">
+    <h1>Find the cheapest place to stay</h1>
+    <p class="lede">Write the city, dates and budget the way you'd say them. It checks Google Hotels and sorts by what you'd pay for the whole stay.</p>
 
-  <div class="chips">
-    {% for ex in examples %}
-      <button type="button" class="chip" onclick="document.getElementById('q').value=this.dataset.t; document.getElementById('q').focus();" data-t="{{ ex }}">{{ ex }}</button>
-    {% endfor %}
-  </div>
-
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
-
-  {% if searched and not error %}
-    <p class="note">Searched for: {{ understood }}</p>
-    {% if not results %}
-      <div class="error">No hotels matched. Try a higher budget, a lower minimum rating, or different dates.</div>
-    {% endif %}
-    {% if summary %}<div class="summary">{{ summary }}</div>{% endif %}
-    {% for h in results %}
-      <div class="hotel">
-        <div class="top">
-          <span class="name">{{ loop.index }}. {{ h.name }}</span>
-          <span class="total">{{ cur }} {{ "%.0f"|format(h.total) }}</span>
-        </div>
-        <div class="meta">
-          {{ cur }} {{ "%.0f"|format(h.per_night) }} per night
-          {% if h.rating %} | <span class="badge">{{ h.rating }} stars</span>{% else %} | no rating{% endif %}
-        </div>
-        {% if h.link %}<a href="{{ h.link }}" target="_blank" rel="noopener noreferrer">Open hotel website</a>{% endif %}
+    <form method="get" action="/" id="form">
+      <div class="ask">
+        <label for="q" class="sr-only">Describe your trip</label>
+        <textarea name="q" id="q" required maxlength="300"
+          placeholder="For example: Kelowna, Dec 5 to 7, under $180 a night">{{ q }}</textarea>
+        <button class="go" id="go" type="submit">Find hotels</button>
       </div>
-    {% endfor %}
-    {% if results %}
-      <footer>Prices come from Google Hotels and may not include taxes and fees. Check the final price before booking.</footer>
+    </form>
+
+    {% if not searched %}
+    <ul class="try" aria-label="Example searches">
+      {% for ex in examples %}
+        <li><button type="button" data-t="{{ ex }}">{{ ex }}</button></li>
+      {% endfor %}
+    </ul>
     {% endif %}
-  {% endif %}
+  </section>
+
+  <section class="results" id="results" aria-live="polite">
+    {% if error %}
+      <p class="notice" role="alert">{{ error }}</p>
+    {% elif searched %}
+      <ul class="understood" aria-label="What was searched">
+        {% for p in understood %}<li>{{ p }}</li>{% endfor %}
+      </ul>
+
+      {% if not results %}
+        <p class="notice">No hotels matched. Raise the budget, lower the minimum rating, or try other dates.</p>
+      {% else %}
+        {% if summary %}<p class="summary">{{ summary }}</p>{% endif %}
+        <ol class="list">
+        {% for h in results %}
+          <li>
+            {% if h.link %}<a class="card {{ 'ticket' if h.cheapest else 'row' }}" href="{{ h.link }}" target="_blank" rel="noopener noreferrer">
+            {% else %}<div class="card {{ 'ticket' if h.cheapest else 'row' }}">{% endif %}
+              <div class="info">
+                {% if h.cheapest or h.top %}
+                <div class="tags">
+                  {% if h.cheapest %}<span class="tag cheap">Cheapest</span>{% endif %}
+                  {% if h.top %}<span class="tag">Top rated</span>{% endif %}
+                </div>
+                {% endif %}
+                <p class="name">{{ h.name }}</p>
+                <p class="meta">
+                  {% if h.rating %}
+                  <span class="stars"><svg viewBox="0 0 20 20" aria-hidden="true"><path fill="currentColor" d="M10 1.8l2.5 5.2 5.7.8-4.1 4 1 5.6L10 14.7l-5.1 2.7 1-5.6-4.1-4 5.7-.8z"/></svg>{{ h.rating }} rating</span>
+                  {% else %}<span>No rating yet</span>{% endif %}
+                  {% if not h.cheapest and h.extra >= 1 %}<span>{{ cur }} {{ "%.0f"|format(h.extra) }} more than the cheapest</span>{% endif %}
+                </p>
+                {% if h.link %}<span class="visit">Open hotel website</span>{% endif %}
+              </div>
+              <div class="price">
+                <div class="amount"><small>{{ cur }}</small>{{ "%.0f"|format(h.total) }}</div>
+                <div class="per">{{ cur }} {{ "%.0f"|format(h.per_night) }} a night</div>
+              </div>
+            {% if h.link %}</a>{% else %}</div>{% endif %}
+          </li>
+        {% endfor %}
+        </ol>
+        <p class="fine">Totals are for {{ nights }} night{{ 's' if nights != 1 }}. Prices come from Google Hotels and may not include taxes and fees, so check the final price on the hotel's site before booking.</p>
+      {% endif %}
+    {% endif %}
+  </section>
 </main>
+
+<script>
+  var form = document.getElementById('form'), go = document.getElementById('go'), q = document.getElementById('q');
+  document.querySelectorAll('.try button').forEach(function (b) {
+    b.addEventListener('click', function () { q.value = b.dataset.t; q.focus(); });
+  });
+  q.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (q.value.trim()) form.requestSubmit(); }
+  });
+  form.addEventListener('submit', function () {
+    go.disabled = true; go.textContent = 'Checking prices';
+    var r = document.getElementById('results');
+    r.setAttribute('aria-busy', 'true');
+    r.innerHTML = '<p class="waiting">Checking prices. This takes about 10 seconds.</p><div class="list"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
+  });
+  window.addEventListener('pageshow', function () { go.disabled = false; go.textContent = 'Find hotels'; });
+</script>
 </body>
 </html>
 """
@@ -174,13 +327,13 @@ EXAMPLES = [
 def home():
     q = request.args.get("q", "").strip()[:300]
     ctx = {"q": q, "examples": EXAMPLES, "searched": False, "error": "", "results": [],
-           "summary": "", "understood": "", "cur": "CAD"}
+           "summary": "", "understood": [], "cur": "CAD", "nights": 0}
     if q:
         ctx["searched"] = True
         try:
-            params, results, summary = run_search(q)
-            ctx.update(results=results, summary=summary, understood=describe(params),
-                       cur=params.get("currency", "CAD"))
+            params, nights, results, summary = run_search(q)
+            ctx.update(results=decorate(results), summary=summary, nights=nights,
+                       understood=pills(params, nights), cur=params.get("currency", "CAD"))
         except UserError as e:
             ctx["error"] = str(e)
     return render_template_string(PAGE, **ctx)
