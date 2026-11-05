@@ -1,5 +1,7 @@
 # hotel-agent
 
+**Live site:** [hotel-agent-sigma.vercel.app](https://hotel-agent-sigma.vercel.app). It asks for a password so strangers can't use up my search quota.
+
 I got tired of checking Google Hotels every few days before a trip, so I built a small tool that does it for me.
 
 You type what you want in plain English, like "Victoria, Nov 20 to 23, under $150 a night, at least 3.5 stars", and it gives back the cheapest places that fit, sorted by total price for the whole stay. There's also a watcher that saves a search and tells you if the price drops.
